@@ -84,6 +84,7 @@ import data_paths
 import dialog
 import jarvis_memory
 import notifier
+import stt
 import tts
 from brain import Brain, BrainConfig, MAX_BOOT_PROJECTS
 from speech import Priority, SpeechScheduler
@@ -98,6 +99,16 @@ log = logging.getLogger("jarvis")
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
 FISH_API_URL = "https://api.fish.audio/v1/tts"
+# Optional voice providers. With OPENAI_API_KEY the browser records each
+# utterance as a WAV and OpenAI transcribes it (instead of Chrome's Web Speech
+# API); with ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID, ElevenLabs speaks
+# instead of Fish.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+STT_MODEL = os.getenv("JARVIS_STT_MODEL", "gpt-4o-transcribe")
+STT_ENGINE = "openai" if OPENAI_API_KEY else "browser"
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # lowest latency, multilingual
 USER_NAME = os.getenv("USER_NAME", "sir")
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
@@ -336,7 +347,18 @@ STT_CORRECTIONS = {
     r"\bquad\b": "Claude",
     r"\btravis\b": "JARVIS",
     r"\bjarves\b": "JARVIS",
+    r"\bjarvys\b": "JARVIS",
+    r"\bobsidiana\b": "Obsidian",
+    r"\b(guar|wor) ?r[uo]+m\b": "War Room",
+    r"\b(cock pit|cokpit|kokpit)\b": "Cockpit",
 }
+
+# "ELITs", "lits", "leeds", "elites" are what STT makes of "leads" — but only
+# in a sentence about sales. "Las elites del deporte" is left alone.
+LEAD_MISHEARINGS = r"\b(elits|e-lits|lits|leeds|lids|elites|lides)\b"
+SALES_CONTEXT = re.compile(
+    r"\b(ventas?|vend\w*|prospect\w*|client\w*|pipeline|crm|seguimiento|llamar|"
+    r"contactar|cerrar|nuevos|cu[aá]ntos|sales|new|follow)\b", re.IGNORECASE)
 
 
 def apply_speech_corrections(text: str) -> str:
@@ -345,7 +367,27 @@ def apply_speech_corrections(text: str) -> str:
     result = text
     for pattern, replacement in STT_CORRECTIONS.items():
         result = _stt_re.sub(pattern, replacement, result, flags=_stt_re.IGNORECASE)
+    if SALES_CONTEXT.search(result):
+        result = _stt_re.sub(LEAD_MISHEARINGS, "leads", result, flags=_stt_re.IGNORECASE)
     return result
+
+
+# Simple asks answered without a brain turn: no tokens, no wait. Anything
+# that does not match whole goes to the brain and its tools as before.
+FAST_ROUTES = [
+    (re.compile(r"^(qu[eé] hora es|what time is it)\W*$", re.I),
+     lambda: f"Son las {datetime.now():%H:%M}."),
+    (re.compile(r"^(qu[eé] (d[ií]a|fecha) es hoy|what(?:'s| is) (?:the )?date(?: today)?)\W*$", re.I),
+     lambda: f"Hoy es {datetime.now():%d/%m/%Y}."),
+]
+
+
+def fast_reply(text: str) -> Optional[str]:
+    t = text.strip(" ¿¡")
+    for pattern, answer in FAST_ROUTES:
+        if pattern.match(t):
+            return answer()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +653,11 @@ async def _voice_emit(msg: dict) -> None:
 
 
 async def _synth_for_speech(text: str) -> Optional[bytes]:
-    r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
+    if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
+        r = await tts.synthesize_chunk_elevenlabs(text, api_key=ELEVENLABS_API_KEY, voice_id=ELEVENLABS_VOICE_ID,
+                                                  model=ELEVENLABS_MODEL, client=_tts_client)
+    else:
+        r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
     if r is None:
         return None
     _session_tokens["tts_calls"] += 1
@@ -6594,7 +6640,8 @@ async def voice_handler(ws: WebSocket):
         # Through this client's own queue, not straight down the socket, so
         # the opening frames cannot be overtaken by a broadcast that lands
         # while they are in flight.
-        _enqueue(queue, {"type": "config", "muteMicDuringSpeech": MUTE_MIC_DURING_SPEECH})
+        _enqueue(queue, {"type": "config", "muteMicDuringSpeech": MUTE_MIC_DURING_SPEECH,
+                         "stt": STT_ENGINE})
         _enqueue(queue, {"type": "status", "state": "idle"})
 
         global _last_greeting_time
@@ -6678,6 +6725,11 @@ async def voice_handler(ws: WebSocket):
                 log.info(f"User: {text}")
                 if _is_fresh_start(text):
                     _spawn(_start_fresh())
+                    continue
+                quick = fast_reply(text)
+                if quick:
+                    log.info(f"JARVIS (fast route): {quick}")
+                    await speech.say(quick, Priority.NORMAL)
                     continue
                 _spawn(_handle_utterance(text))
     except WebSocketDisconnect:
@@ -6847,6 +6899,31 @@ async def api_settings_keys(body: KeyUpdate):
     except ValueError as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=400)
     return {"success": True}
+
+@app.post("/api/stt")
+async def api_stt(request: Request):
+    """One recorded utterance (WAV) -> its text, via OpenAI.
+
+    The browser then sends that text over /ws/voice as an ordinary final
+    transcript, so echo rejection, barge-in, corrections and routing are the
+    same as for the Web Speech path. Gated by web_auth like every POST.
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=409, detail="OPENAI_API_KEY is not set")
+    try:
+        declared = int(request.headers.get("content-length", "0"))
+    except ValueError:
+        declared = 0
+    if declared > stt.MAX_WAV_BYTES:
+        raise HTTPException(status_code=413, detail="WAV over 10 MB")
+    wav = await request.body()
+    if len(wav) > stt.MAX_WAV_BYTES or not stt.is_wav(wav):
+        raise HTTPException(status_code=400, detail="expected a WAV under 10 MB")
+    text = await stt.transcribe(wav, api_key=OPENAI_API_KEY, model=STT_MODEL, client=_tts_client)
+    if text is None:
+        raise HTTPException(status_code=502, detail="transcription failed")
+    return {"text": text}
+
 
 @app.post("/api/settings/test-fish")
 async def api_test_fish(body: KeyTest):
