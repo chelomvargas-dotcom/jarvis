@@ -88,7 +88,9 @@ arbitrary LLM and file content, so everything goes through
   forwards `tools/call` to `POST /internal/tool`
 - `speech.py` — Sentence splitting and the scheduler that owns every
   utterance JARVIS speaks
-- `tts.py` — Fish Audio synthesis, one request per sentence chunk
+- `tts.py` — Fish Audio (or ElevenLabs, when keyed) synthesis, one request per sentence chunk
+- `stt.py` — OpenAI transcription of one browser-recorded WAV (`POST /api/stt`),
+  used instead of Web Speech when `OPENAI_API_KEY` is set
 - `frontend/src/orb.ts` — Three.js particle orb visualization
 - `frontend/src/voice.ts` — Web Speech API + audio playback
 - `frontend/src/main.ts` — Frontend state machine
