@@ -191,8 +191,17 @@ def mp3_seconds(data: Optional[bytes]) -> float:
     return 0.0
 
 
+def wav_seconds(data: Optional[bytes]) -> float:
+    """How long a canonical PCM WAV (what Piper writes) plays. 0.0 otherwise."""
+    if not data or len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return 0.0
+    byte_rate = int.from_bytes(data[28:32], "little")
+    return (len(data) - 44) / byte_rate if byte_rate else 0.0
+
+
 def ack_floor_seconds(audio: Optional[bytes]) -> float:
-    return min(mp3_seconds(audio) * ACK_FLOOR_FACTOR, ACK_FLOOR_MAX_SEC)
+    seconds = wav_seconds(audio) or mp3_seconds(audio)
+    return min(seconds * ACK_FLOOR_FACTOR, ACK_FLOOR_MAX_SEC)
 
 # A one- or two-word utterance whose every token JARVIS just said is only an
 # echo if it arrived while that speech was still coming out of the speaker.

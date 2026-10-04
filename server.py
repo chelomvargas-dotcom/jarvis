@@ -99,13 +99,18 @@ log = logging.getLogger("jarvis")
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
 FISH_API_URL = "https://api.fish.audio/v1/tts"
-# Optional voice providers. With OPENAI_API_KEY the browser records each
-# utterance as a WAV and OpenAI transcribes it (instead of Chrome's Web Speech
-# API); with ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID, ElevenLabs speaks
-# instead of Fish.
+# Optional voice providers. JARVIS_STT=local has the browser record each
+# utterance as a WAV and faster-whisper transcribe it on this machine (free);
+# =openai sends it to OpenAI instead; =browser (the default without an OpenAI
+# key) keeps Chrome's Web Speech API. For the voice, PIPER_VOICE (a local .onnx
+# model, free) wins over ElevenLabs, which wins over Fish.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 STT_MODEL = os.getenv("JARVIS_STT_MODEL", "gpt-4o-transcribe")
-STT_ENGINE = "openai" if OPENAI_API_KEY else "browser"
+WHISPER_MODEL = os.getenv("JARVIS_WHISPER_MODEL", "small")
+STT_ENGINE = os.getenv("JARVIS_STT", "openai" if OPENAI_API_KEY else "browser").lower()
+if STT_ENGINE not in ("browser", "openai", "local"):
+    STT_ENGINE = "browser"
+PIPER_VOICE = os.getenv("PIPER_VOICE", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # lowest latency, multilingual
@@ -653,7 +658,9 @@ async def _voice_emit(msg: dict) -> None:
 
 
 async def _synth_for_speech(text: str) -> Optional[bytes]:
-    if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
+    if PIPER_VOICE:
+        r = await tts.synthesize_chunk_piper(text, model_path=PIPER_VOICE)
+    elif ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
         r = await tts.synthesize_chunk_elevenlabs(text, api_key=ELEVENLABS_API_KEY, voice_id=ELEVENLABS_VOICE_ID,
                                                   model=ELEVENLABS_MODEL, client=_tts_client)
     else:
@@ -6902,14 +6909,14 @@ async def api_settings_keys(body: KeyUpdate):
 
 @app.post("/api/stt")
 async def api_stt(request: Request):
-    """One recorded utterance (WAV) -> its text, via OpenAI.
+    """One recorded utterance (WAV) -> its text, via local whisper or OpenAI.
 
     The browser then sends that text over /ws/voice as an ordinary final
     transcript, so echo rejection, barge-in, corrections and routing are the
     same as for the Web Speech path. Gated by web_auth like every POST.
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=409, detail="OPENAI_API_KEY is not set")
+    if STT_ENGINE == "browser" or (STT_ENGINE == "openai" and not OPENAI_API_KEY):
+        raise HTTPException(status_code=409, detail="server-side STT is off (set JARVIS_STT)")
     try:
         declared = int(request.headers.get("content-length", "0"))
     except ValueError:
@@ -6919,7 +6926,10 @@ async def api_stt(request: Request):
     wav = await request.body()
     if len(wav) > stt.MAX_WAV_BYTES or not stt.is_wav(wav):
         raise HTTPException(status_code=400, detail="expected a WAV under 10 MB")
-    text = await stt.transcribe(wav, api_key=OPENAI_API_KEY, model=STT_MODEL, client=_tts_client)
+    if STT_ENGINE == "local":
+        text = await stt.transcribe_local(wav, model=WHISPER_MODEL)
+    else:
+        text = await stt.transcribe(wav, api_key=OPENAI_API_KEY, model=STT_MODEL, client=_tts_client)
     if text is None:
         raise HTTPException(status_code=502, detail="transcription failed")
     return {"text": text}

@@ -1,5 +1,7 @@
-"""Layer 6 voice: OpenAI STT, ElevenLabs TTS, Spanish corrections, fast route."""
+"""Layer 6 voice: local whisper / OpenAI STT, Piper / ElevenLabs TTS, Spanish corrections, fast route."""
 import io
+import sys
+import types
 import wave
 
 import httpx
@@ -9,6 +11,12 @@ import preflight
 import stt
 import tts
 from tests.test_voice_ws import client, _drain_until  # noqa: F401  (fixture)
+import server as _server
+
+# The `client` fixture swaps _synth_for_speech for a fake; keep the real one.
+# reload() re-runs the module in the same namespace, so it still sees the
+# monkeypatched settings.
+REAL_SYNTH = _server._synth_for_speech
 
 
 def _wav() -> bytes:
@@ -52,7 +60,9 @@ def test_config_announces_openai_stt_when_keyed(client, monkeypatch):
 
 def test_stt_endpoint(client, monkeypatch):
     c, server = client
-    assert c.post("/api/stt", content=_wav()).status_code == 409        # no key
+    assert c.post("/api/stt", content=_wav()).status_code == 409        # browser STT: endpoint off
+    monkeypatch.setattr(server, "STT_ENGINE", "openai")
+    assert c.post("/api/stt", content=_wav()).status_code == 409        # openai without a key
     monkeypatch.setattr(server, "OPENAI_API_KEY", "sk-test")
     assert c.post("/api/stt", content=b"not a wav").status_code == 400
     seen = {}
@@ -70,9 +80,20 @@ def test_stt_endpoint(client, monkeypatch):
     assert c.post("/api/stt", content=_wav()).status_code == 502
 
 
+def test_stt_endpoint_uses_local_whisper_when_asked(client, monkeypatch):
+    c, server = client
+    monkeypatch.setattr(server, "STT_ENGINE", "local")
+
+    async def fake_local(wav, **kw):
+        assert kw["model"] == server.WHISPER_MODEL
+        return "cuántos leeds nuevos"
+    monkeypatch.setattr(stt, "transcribe_local", fake_local)
+    assert c.post("/api/stt", content=_wav()).json() == {"text": "cuántos leeds nuevos"}
+
+
 def test_stt_endpoint_refuses_a_foreign_origin(client, monkeypatch):
     c, server = client
-    monkeypatch.setattr(server, "OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(server, "STT_ENGINE", "local")
     r = c.post("/api/stt", content=_wav(), headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
 
@@ -113,4 +134,74 @@ def test_preflight_accepts_elevenlabs_instead_of_fish(monkeypatch):
     monkeypatch.delenv("FISH_API_KEY", raising=False)
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el")
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "v1")
+    assert preflight._check_fish_api_key_sync().status == preflight.STATUS_OK
+
+
+@pytest.mark.asyncio
+async def test_transcribe_local_passes_the_vocabulary_to_whisper(monkeypatch):
+    calls = {}
+
+    class FakeModel:
+        def __init__(self, name, **kw):
+            calls["name"] = name
+
+        def transcribe(self, audio, **kw):
+            calls.update(kw, audio=audio.read())
+            return iter([types.SimpleNamespace(text=" cuántos "), types.SimpleNamespace(text="leads ")]), None
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeModel))
+    monkeypatch.setattr(stt, "_whisper", None)
+    assert await stt.transcribe_local(_wav(), model="small") == "cuántos leads"
+    assert calls["name"] == "small" and calls["audio"] == _wav()
+    assert "War Room" in calls["initial_prompt"] and calls["vad_filter"] is True
+
+
+@pytest.mark.asyncio
+async def test_transcribe_local_without_the_package_returns_none(monkeypatch):
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)     # import raises ImportError
+    monkeypatch.setattr(stt, "_whisper", None)
+    assert await stt.transcribe_local(_wav(), model="small") is None
+
+
+@pytest.mark.asyncio
+async def test_piper_returns_a_wav_with_a_readable_length(monkeypatch):
+    import speech
+
+    class FakeVoice:
+        @staticmethod
+        def load(path):
+            assert path == "/voices/es.onnx"
+            return FakeVoice()
+
+        def synthesize_wav(self, text, w):
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
+            w.writeframes(b"\0" * 44100)                            # one second
+    monkeypatch.setitem(sys.modules, "piper", types.SimpleNamespace(PiperVoice=FakeVoice))
+    monkeypatch.setattr(tts, "_piper_voices", {})
+    r = await tts.synthesize_chunk_piper("Hola.", model_path="/voices/es.onnx")
+    assert r.audio[:4] == b"RIFF"
+    assert speech.wav_seconds(r.audio) == pytest.approx(1.0)
+    assert speech.ack_floor_seconds(r.audio) > 0
+
+
+@pytest.mark.asyncio
+async def test_piper_wins_over_the_cloud_voices(client, monkeypatch):
+    _, server = client
+    monkeypatch.setattr(server, "PIPER_VOICE", "/voices/es.onnx")
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "el")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "v1")
+
+    async def fake_piper(text, **kw):
+        return tts.SynthResult(b"WAV:" + text.encode(), 0.0, 0.0)
+
+    async def never(*a, **kw):
+        raise AssertionError("a cloud voice was called while PIPER_VOICE is set")
+    monkeypatch.setattr(tts, "synthesize_chunk_piper", fake_piper)
+    monkeypatch.setattr(tts, "synthesize_chunk_elevenlabs", never)
+    monkeypatch.setattr(tts, "synthesize_chunk", never)
+    assert await REAL_SYNTH("Hola") == b"WAV:Hola"
+
+
+def test_preflight_accepts_piper_instead_of_fish(monkeypatch):
+    monkeypatch.delenv("FISH_API_KEY", raising=False)
+    monkeypatch.setenv("PIPER_VOICE", "/voices/es.onnx")
     assert preflight._check_fish_api_key_sync().status == preflight.STATUS_OK

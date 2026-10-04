@@ -174,8 +174,8 @@ socket.onMessage((msg) => {
 
   if (type === "config") {
     muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
-    if (msg.stt === "openai" && !usingWavInput) {
-      // The server transcribes with OpenAI: record WAVs instead of using
+    if ((msg.stt === "local" || msg.stt === "openai") && !usingWavInput) {
+      // The server transcribes (local whisper or OpenAI): record WAVs instead of using
       // Chrome's recogniser. Swapped once; keeps whatever listening state
       // the old input was in.
       usingWavInput = true;

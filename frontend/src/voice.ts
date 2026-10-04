@@ -472,10 +472,10 @@ export function createVoiceInput(
 }
 
 // ---------------------------------------------------------------------------
-// Voice Input (OpenAI) — record each utterance as a WAV, server transcribes it
+// Voice Input (server STT) — record each utterance as a WAV, server transcribes it
 // ---------------------------------------------------------------------------
 
-// Used instead of createVoiceInput when the server says `stt: "openai"`.
+// Used instead of createVoiceInput when the server says `stt: "local"` or `"openai"`.
 // The voice-activity detector is the same RMS test the mic monitor uses: an
 // utterance starts after VAD_START_MS of sound above SPEECH_LEVEL and ends
 // after VAD_END_MS below it. PRE_ROLL_MS of audio from before the start is
@@ -574,7 +574,7 @@ export function createWavVoiceInput(
       proc.onaudioprocess = (ev) => onFrame(ev.inputBuffer.getChannelData(0).slice(), ctx.sampleRate);
       src.connect(proc);
       proc.connect(ctx.destination);       // outputs silence; Chrome only runs a connected processor
-      onMicEvent("wav capture attached (OpenAI STT)");
+      onMicEvent("wav capture attached (server STT)");
     } catch (e) {
       opened = false;
       onError("Microphone blocked — check this origin's mic permission.");

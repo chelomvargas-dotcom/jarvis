@@ -1,13 +1,16 @@
 """
-tts.py — Fish Audio (or ElevenLabs) synthesis, one request per sentence chunk.
+tts.py — Fish Audio (or ElevenLabs, or local Piper) synthesis, one request per sentence chunk.
 
 The response is streamed so time-to-first-byte can be measured; the chunk is
 returned whole because the browser decodes one complete MP3 per chunk.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import time
+import wave
 from dataclasses import dataclass
 from typing import Optional
 
@@ -81,3 +84,37 @@ async def _synthesize(text: str, api_key: str, url: str, headers: dict, body: di
     if not buf:
         return None
     return SynthResult(bytes(buf), first if first is not None else 0.0, time.monotonic() - t0)
+
+
+_piper_voices: dict = {}
+
+
+async def synthesize_chunk_piper(text: str, *, model_path: str) -> Optional[SynthResult]:
+    """Same contract as synthesize_chunk, voiced locally by Piper (free, offline).
+
+    Returns a WAV rather than an mp3; the browser decodes either, and
+    speech.ack_floor_seconds reads both.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    def run() -> bytes:
+        # Optional dependency, only when PIPER_VOICE is set: pip install piper-tts
+        from piper import PiperVoice
+        voice = _piper_voices.get(model_path)
+        if voice is None:
+            voice = _piper_voices[model_path] = PiperVoice.load(model_path)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            voice.synthesize_wav(text, w)
+        return buf.getvalue()
+
+    t0 = time.monotonic()
+    try:
+        audio = await asyncio.to_thread(run)
+    except Exception as e:      # missing package, missing model file
+        log.error(f"Piper TTS error: {e}")
+        return None
+    total = time.monotonic() - t0
+    return SynthResult(audio, total, total)
