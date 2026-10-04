@@ -91,6 +91,10 @@ arbitrary LLM and file content, so everything goes through
 - `tts.py` — Fish Audio (or ElevenLabs, when keyed) synthesis, one request per sentence chunk
 - `stt.py` — OpenAI transcription of one browser-recorded WAV (`POST /api/stt`),
   used instead of Web Speech when `OPENAI_API_KEY` is set
+- `intent_router.py` — Layer 7: keyword rules (optional cheap-LLM fallback) turn
+  each transcript into intent, destination, query and risk; `server._route_utterance`
+  answers low-risk routes directly and hands the rest to the brain with the route
+  as a hint
 - `frontend/src/orb.ts` — Three.js particle orb visualization
 - `frontend/src/voice.ts` — Web Speech API + audio playback
 - `frontend/src/main.ts` — Frontend state machine
@@ -175,6 +179,10 @@ JARVIS builds**. It is only this repository's own copies that are gone.
 - `WEATHER_LOCATION_LABEL` / `WEATHER_LATITUDE` / `WEATHER_LONGITUDE` /
   `WEATHER_UNIT` (all optional) — override the auto-detected (public-IP)
   weather location and units
+- `OBSIDIAN_VAULT` (optional) — vault folder the Obsidian route searches
+- `JARVIS_ROUTER_LLM` (optional, default off; needs `OPENAI_API_KEY`) — classify
+  what the keyword rules miss with `JARVIS_ROUTER_MODEL` (default `gpt-4o-mini`)
+- `JARVIS_COMMAND_CENTER_URL` (optional, default `https://localhost:8340/dashboard`)
 - `JARVIS_ALLOWED_ORIGINS` (optional) — extra origins the web boundary
   accepts, comma-separated. Only needed when the page is opened at an
   address JARVIS does not serve from itself (a LAN IP, a tunnel). Their

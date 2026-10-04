@@ -82,9 +82,11 @@ import web_auth
 from run_executor import RunExecutor
 import data_paths
 import dialog
+import intent_router
 import jarvis_memory
 import notifier
 import stt
+from urllib.parse import quote_plus
 import tts
 from brain import Brain, BrainConfig, MAX_BOOT_PROJECTS
 from speech import Priority, SpeechScheduler
@@ -109,6 +111,12 @@ STT_ENGINE = "openai" if OPENAI_API_KEY else "browser"
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # lowest latency, multilingual
+# Layer 7 routing (intent_router.py). The LLM fallback is opt-in: it would add
+# a round trip to every utterance the keyword rules don't recognise.
+ROUTER_LLM = os.getenv("JARVIS_ROUTER_LLM", "").lower() in ("1", "true", "yes") and bool(OPENAI_API_KEY)
+ROUTER_MODEL = os.getenv("JARVIS_ROUTER_MODEL", "gpt-4o-mini")
+OBSIDIAN_VAULT = os.getenv("OBSIDIAN_VAULT", "")
+COMMAND_CENTER_URL = os.getenv("JARVIS_COMMAND_CENTER_URL") or "https://localhost:8340/dashboard"
 USER_NAME = os.getenv("USER_NAME", "sir")
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
@@ -1667,6 +1675,50 @@ class _OneLinePerTurn:
             self._sink(text)
 
 
+def _search_vault(query: str) -> list[dict]:
+    vault = Path(OBSIDIAN_VAULT).expanduser()
+    return jarvis_memory.search(query, limit=3, sources=[("obsidian", p) for p in vault.rglob("*.md")])
+
+
+async def _execute_route(r: intent_router.Route) -> Optional[str]:
+    """Run a low-risk route without the brain. None = the brain handles it."""
+    if r.risk != intent_router.LOW:
+        return None
+    if r.destination == "obsidian" and OBSIDIAN_VAULT and r.query:
+        hits = await asyncio.to_thread(_search_vault, r.query)
+        if not hits:
+            return f"No encontré nada sobre {r.query} en Obsidian."
+        rest = ", ".join(h["name"] for h in hits[1:])
+        return f"En Obsidian, {hits[0]['name']}: {hits[0]['excerpt']}" + (f" También: {rest}." if rest else "")
+    if r.destination == "memory" and r.query:
+        return tool_recall({"query": r.query})
+    if r.destination == "weather" and not r.query:     # a named city is the brain's
+        return await asyncio.to_thread(_fetch_weather_string_sync)
+    if r.destination == "command_center":
+        return await tool_open_in_browser({"target": COMMAND_CENTER_URL})
+    if r.destination == "web" and r.query:
+        return await tool_open_in_browser(
+            {"target": "https://www.google.com/search?q=" + quote_plus(r.query)})
+    return None
+
+
+async def _route_utterance(text: str) -> tuple[Optional[str], str]:
+    """(what to say without a brain turn, or None; the text for the brain)."""
+    r = intent_router.route(text)
+    if r is None and ROUTER_LLM:
+        r = await intent_router.classify(text, api_key=OPENAI_API_KEY, model=ROUTER_MODEL,
+                                         client=_tts_client)
+    if r is None or r.intent == intent_router.GENERAL:
+        return None, text
+    log.info(f"route: {r}")
+    try:
+        answer = await _execute_route(r)
+    except Exception as e:      # a broken handler must not cost the user his answer
+        log.error(f"route {r.intent} failed, handing to the brain: {e}", exc_info=True)
+        answer = None
+    return answer, (text if answer else intent_router.brain_hint(r) + text)
+
+
 async def _handle_utterance(text: str) -> None:
     """One user utterance → one brain turn → streamed speech. Runs as a task so
     the socket loop keeps receiving `played` acks and interim text meanwhile."""
@@ -1674,6 +1726,11 @@ async def _handle_utterance(text: str) -> None:
         return
     t0 = time.monotonic()
     await _voice_emit({"type": "status", "state": "thinking"})
+    answer, text = await _route_utterance(text)
+    if answer:
+        log.info(f"JARVIS (routed): {answer}")
+        await speech.say(answer, Priority.NORMAL)
+        return
     if not brain_instance.ready:
         if brain_instance.failed:
             line = (_AUTH_BRAIN_DOWN_LINE

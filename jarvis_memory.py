@@ -477,6 +477,9 @@ _STOP_WORDS = frozenset({
     "in", "is", "it", "its", "of", "on", "or", "our", "she", "so", "that",
     "the", "their", "them", "there", "they", "this", "to", "was", "we",
     "were", "what", "when", "which", "who", "with", "you", "your",
+    # Spanish: the user speaks it, and "de" alone would match every file.
+    "al", "con", "de", "del", "el", "en", "es", "la", "las", "lo", "los",
+    "mi", "mis", "para", "por", "que", "se", "su", "un", "una", "y",
 })
 
 
@@ -607,19 +610,21 @@ def _sources() -> list[tuple[str, Path]]:
     return out
 
 
-def search(query: str, limit: int = 5) -> list[dict]:
-    """Scored scan of the folder. No index, so it can never be stale."""
+def search(query: str, limit: int = 5,
+           sources: list[tuple[str, Path]] | None = None) -> list[dict]:
+    """Scored scan of the folder (or of `sources`, e.g. an Obsidian vault).
+    No index, so it can never be stale."""
     words = {
-        w for w in re.split(r"[^a-z0-9]+", (query or "").lower())
+        w for w in re.split(r"[\W_]+", (query or "").lower())
         if len(w) > 1 and w not in _STOP_WORDS
     }
     if not words:
         return []
     hits = []
-    for kind, path in _sources():
+    for kind, path in (_sources() if sources is None else sources):
         try:
             body = path.read_text()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         score = _score(words, path.stem, body)
         if score:
