@@ -1,13 +1,16 @@
 """
-tts.py — Fish Audio synthesis, one request per sentence chunk.
+tts.py — Fish Audio (or ElevenLabs, or local Piper) synthesis, one request per sentence chunk.
 
 The response is streamed so time-to-first-byte can be measured; the chunk is
 returned whole because the browser decodes one complete MP3 per chunk.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import time
+import wave
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,6 +19,8 @@ import httpx
 log = logging.getLogger("jarvis.tts")
 
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+# mp3 at 44.1 kHz / 128 kbps — the same kind of chunk the browser already decodes for Fish.
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128"
 
 
 @dataclass
@@ -28,6 +33,26 @@ class SynthResult:
 async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
                            client: Optional[httpx.AsyncClient] = None,
                            latency: str = "balanced", timeout: float = 15.0) -> Optional[SynthResult]:
+    return await _synthesize(
+        text, api_key, FISH_TTS_URL,
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        {"text": text, "reference_id": voice_id, "format": "mp3", "mp3_bitrate": 128, "latency": latency},
+        client, timeout)
+
+
+async def synthesize_chunk_elevenlabs(text: str, *, api_key: str, voice_id: str, model: str,
+                                      client: Optional[httpx.AsyncClient] = None,
+                                      timeout: float = 15.0) -> Optional[SynthResult]:
+    """Same contract as synthesize_chunk, voiced by ElevenLabs."""
+    return await _synthesize(
+        text, api_key, ELEVENLABS_TTS_URL.format(voice_id=voice_id),
+        {"xi-api-key": api_key, "Content-Type": "application/json"},
+        {"text": text, "model_id": model},
+        client, timeout)
+
+
+async def _synthesize(text: str, api_key: str, url: str, headers: dict, body: dict,
+                      client: Optional[httpx.AsyncClient], timeout: float) -> Optional[SynthResult]:
     text = (text or "").strip()
     if not text or not api_key:
         return None
@@ -38,10 +63,7 @@ async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
     buf = bytearray()
     try:
         async with client.stream(
-            "POST", FISH_TTS_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"text": text, "reference_id": voice_id, "format": "mp3", "mp3_bitrate": 128, "latency": latency},
-            timeout=timeout,
+            "POST", url, headers=headers, json={**body, "text": text}, timeout=timeout,
         ) as resp:
             if resp.status_code != 200:
                 log.error(f"TTS {resp.status_code} for {text[:40]!r}")
@@ -62,3 +84,37 @@ async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
     if not buf:
         return None
     return SynthResult(bytes(buf), first if first is not None else 0.0, time.monotonic() - t0)
+
+
+_piper_voices: dict = {}
+
+
+async def synthesize_chunk_piper(text: str, *, model_path: str) -> Optional[SynthResult]:
+    """Same contract as synthesize_chunk, voiced locally by Piper (free, offline).
+
+    Returns a WAV rather than an mp3; the browser decodes either, and
+    speech.ack_floor_seconds reads both.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    def run() -> bytes:
+        # Optional dependency, only when PIPER_VOICE is set: pip install piper-tts
+        from piper import PiperVoice
+        voice = _piper_voices.get(model_path)
+        if voice is None:
+            voice = _piper_voices[model_path] = PiperVoice.load(model_path)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            voice.synthesize_wav(text, w)
+        return buf.getvalue()
+
+    t0 = time.monotonic()
+    try:
+        audio = await asyncio.to_thread(run)
+    except Exception as e:      # missing package, missing model file
+        log.error(f"Piper TTS error: {e}")
+        return None
+    total = time.monotonic() - t0
+    return SynthResult(audio, total, total)

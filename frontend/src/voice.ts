@@ -1,5 +1,6 @@
 /**
- * Voice input (Web Speech API) and audio output (AudioContext) for JARVIS.
+ * Voice input (Web Speech API, or recorded WAV for OpenAI STT) and audio
+ * output (AudioContext) for JARVIS.
  *
  * The microphone keeps listening while JARVIS speaks — the server decides what
  * is echo and what is a barge-in. Playback is a strictly ordered queue of
@@ -467,6 +468,126 @@ export function createVoiceInput(
         if (shouldListen && !paused) startSpare();
       }, RESTART_DELAY_MS);
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Voice Input (server STT) — record each utterance as a WAV, server transcribes it
+// ---------------------------------------------------------------------------
+
+// Used instead of createVoiceInput when the server says `stt: "local"` or `"openai"`.
+// The voice-activity detector is the same RMS test the mic monitor uses: an
+// utterance starts after VAD_START_MS of sound above SPEECH_LEVEL and ends
+// after VAD_END_MS below it. PRE_ROLL_MS of audio from before the start is
+// kept so the first syllable is not clipped. These are calibration knobs:
+// raise VAD_END_MS if long pauses cut sentences in two.
+const VAD_START_MS = 150;
+const VAD_END_MS = 800;
+const PRE_ROLL_MS = 300;
+const MAX_UTTERANCE_MS = 30000;
+
+function encodeWav(frames: Float32Array[], rate: number): Blob {
+  const samples = frames.reduce((n, f) => n + f.length, 0);
+  const view = new DataView(new ArrayBuffer(44 + samples * 2));
+  const str = (at: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(at + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); view.setUint32(4, 36 + samples * 2, true); str(8, "WAVE");
+  str(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, "data"); view.setUint32(40, samples * 2, true);
+  let at = 44;
+  for (const f of frames) {
+    for (let i = 0; i < f.length; i++, at += 2) {
+      const v = Math.max(-1, Math.min(1, f[i]));
+      view.setInt16(at, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+  }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+export function createWavVoiceInput(
+  onTranscript: (text: string) => void,
+  onError: (msg: string) => void,
+  onMicEvent: (event: string) => void = () => {}
+): VoiceInput {
+  let listening = false;
+  let paused = false;
+  let opened = false;
+  let preroll: Float32Array[] = [];
+  let frames: Float32Array[] = [];
+  let inSpeech = false;
+  let loudMs = 0;
+  let quietMs = 0;
+  let speechMs = 0;
+
+  function reset() {
+    preroll = []; frames = []; inSpeech = false; loudMs = 0; quietMs = 0; speechMs = 0;
+  }
+
+  async function send(wav: Blob) {
+    try {
+      const r = await fetch("/api/stt", { method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      const text = String((await r.json()).text || "").trim();
+      if (text) onTranscript(text);
+    } catch (e) {
+      onError("Transcription failed — that sentence was dropped.");
+      onMicEvent(`stt error: ${e instanceof Error ? e.message : e}`.slice(0, 120));
+    }
+  }
+
+  function onFrame(buf: Float32Array, rate: number) {
+    if (!listening || paused) { if (inSpeech || preroll.length) reset(); return; }
+    const ms = (buf.length / rate) * 1000;
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const loud = Math.sqrt(sum / buf.length) > SPEECH_LEVEL;
+    if (!inSpeech) {
+      preroll.push(buf);
+      while (preroll.length * ms > PRE_ROLL_MS + VAD_START_MS) preroll.shift();
+      loudMs = loud ? loudMs + ms : 0;
+      if (loudMs >= VAD_START_MS) {
+        inSpeech = true; frames = preroll; preroll = []; quietMs = 0; speechMs = 0;
+      }
+      return;
+    }
+    frames.push(buf);
+    speechMs += ms;
+    quietMs = loud ? 0 : quietMs + ms;
+    if (quietMs >= VAD_END_MS || speechMs >= MAX_UTTERANCE_MS) {
+      const done = frames;
+      reset();
+      void send(encodeWav(done, rate));
+    }
+  }
+
+  async function open() {
+    opened = true;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      const ctx = new AudioContext();
+      const src = ctx.createMediaStreamSource(stream);
+      // ponytail: ScriptProcessorNode is deprecated but needs no extra module
+      // file; move to an AudioWorklet if Chrome ever drops it.
+      const proc = ctx.createScriptProcessor(2048, 1, 1);
+      proc.onaudioprocess = (ev) => onFrame(ev.inputBuffer.getChannelData(0).slice(), ctx.sampleRate);
+      src.connect(proc);
+      proc.connect(ctx.destination);       // outputs silence; Chrome only runs a connected processor
+      onMicEvent("wav capture attached (server STT)");
+    } catch (e) {
+      opened = false;
+      onError("Microphone blocked — check this origin's mic permission.");
+      onMicEvent(`wav capture could not open the microphone: ${e && (e as Error).name}`);
+    }
+  }
+
+  return {
+    start() { listening = true; paused = false; if (!opened) void open(); },
+    stop() { listening = false; reset(); },
+    pause() { paused = true; },
+    resume() { paused = false; },
+    restart(reason: string) { onMicEvent(`restart ignored (wav capture has no recogniser to rebuild): ${reason}`); },
   };
 }
 

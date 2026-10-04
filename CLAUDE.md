@@ -88,7 +88,11 @@ arbitrary LLM and file content, so everything goes through
   forwards `tools/call` to `POST /internal/tool`
 - `speech.py` — Sentence splitting and the scheduler that owns every
   utterance JARVIS speaks
-- `tts.py` — Fish Audio synthesis, one request per sentence chunk
+- `tts.py` — Fish Audio (or local Piper via `PIPER_VOICE`, or ElevenLabs) synthesis,
+  one request per sentence chunk
+- `stt.py` — Transcribes one browser-recorded WAV (`POST /api/stt`) with local
+  faster-whisper (`JARVIS_STT=local`) or OpenAI, instead of Web Speech.
+  `faster-whisper` and `piper-tts` are optional installs, not in requirements.txt
 - `frontend/src/orb.ts` — Three.js particle orb visualization
 - `frontend/src/voice.ts` — Web Speech API + audio playback
 - `frontend/src/main.ts` — Frontend state machine

@@ -6,7 +6,8 @@
  */
 
 import { createOrb, type OrbState } from "./orb";
-import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+import { createVoiceInput, createWavVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+import type { VoiceInput } from "./voice";
 import { createSocket } from "./ws";
 import { openSettings, checkFirstTimeSetup } from "./settings";
 import "./style.css";
@@ -77,12 +78,21 @@ function transition(newState: State) {
 // Voice input
 // ---------------------------------------------------------------------------
 
-const voiceInput = createVoiceInput(
-  (text: string) => {
-    // The server decides whether this is echo, a barge-in, or a new turn.
-    micMonitor.sawSpeech();
-    socket.send({ type: "transcript", text, isFinal: true });
-  },
+function sendTranscript(text: string) {
+  // The server decides whether this is echo, a barge-in, or a new turn.
+  micMonitor.sawSpeech();
+  socket.send({ type: "transcript", text, isFinal: true });
+}
+
+function sendMicEvent(event: string) {
+  // Mirror the recogniser's lifecycle to the server log. Going deaf is a
+  // browser-side failure the server cannot otherwise see at all, and the
+  // console it used to be confined to is never open when it happens.
+  socket.send({ type: "mic", text: event });
+}
+
+let voiceInput: VoiceInput = createVoiceInput(
+  sendTranscript,
   (text: string) => {
     micMonitor.sawSpeech();
     socket.send({ type: "interim", text });
@@ -90,13 +100,9 @@ const voiceInput = createVoiceInput(
   (msg: string) => {
     showError(msg);
   },
-  (event: string) => {
-    // Mirror the recogniser's lifecycle to the server log. Going deaf is a
-    // browser-side failure the server cannot otherwise see at all, and the
-    // console it used to be confined to is never open when it happens.
-    socket.send({ type: "mic", text: event });
-  }
+  sendMicEvent
 );
+let usingWavInput = false;
 
 // A live meter for the microphone itself. If this moves when you speak, the
 // microphone is working — whatever else is or is not happening. It answers
@@ -168,6 +174,16 @@ socket.onMessage((msg) => {
 
   if (type === "config") {
     muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
+    if ((msg.stt === "local" || msg.stt === "openai") && !usingWavInput) {
+      // The server transcribes (local whisper or OpenAI): record WAVs instead of using
+      // Chrome's recogniser. Swapped once; keeps whatever listening state
+      // the old input was in.
+      usingWavInput = true;
+      voiceInput.stop();
+      voiceInput = createWavVoiceInput(sendTranscript, showError, sendMicEvent);
+      voiceInput.start();
+      if (isMuted) voiceInput.pause();
+    }
   } else if (type === "audio") {
     const data = msg.data as string;
     if (data) {

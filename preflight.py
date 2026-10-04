@@ -440,9 +440,13 @@ def _check_screen_recording_sync() -> Check:
 
 
 def _check_fish_api_key_sync() -> Check:
-    """FISH_API_KEY must be set or JARVIS has no voice."""
+    """FISH_API_KEY (or ElevenLabs) must be set or JARVIS has no voice."""
     if os.environ.get("FISH_API_KEY"):
         return Check(name="fish_api_key", status=STATUS_OK, message="FISH_API_KEY is set.")
+    if os.environ.get("PIPER_VOICE"):
+        return Check(name="fish_api_key", status=STATUS_OK, message="PIPER_VOICE is set; Piper speaks locally instead of Fish.")
+    if os.environ.get("ELEVENLABS_API_KEY") and os.environ.get("ELEVENLABS_VOICE_ID"):
+        return Check(name="fish_api_key", status=STATUS_OK, message="ElevenLabs is set; it speaks instead of Fish.")
     return Check(
         name="fish_api_key",
         status=STATUS_FAIL,
