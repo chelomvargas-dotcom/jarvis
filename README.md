@@ -217,6 +217,17 @@ audio, and speak. The dashboard is at `http://localhost:5173/dashboard.html`.
 > This is one of five deliberate trust decisions in this design — see
 > [What this trusts, and why](#what-this-trusts-and-why) before you run it.
 
+### Jarvis de bolsillo (phone)
+
+`scripts/pocket.sh` puts the voice page on your phone over
+[Tailscale](https://tailscale.com/download) (free). Install it on the Mac and
+the phone, sign both in to the same account, then run the script instead of
+`python server.py`. It prints `https://<machine>.<tailnet>.ts.net`; open that
+on the phone and add it to the home screen. The server stays on loopback:
+`tailscale serve` is the only way in, only your tailnet devices can reach it,
+and the one origin it adds to `JARVIS_ALLOWED_ORIGINS` is that address. Turn
+it off with `tailscale serve reset`.
+
 One more thing about Chrome: the microphone permission is scoped to the
 **origin including the port**. If you restart Vite and it lands on 5174, the
 grant does not follow, and Chrome will not re-prompt — it just stays denied,
